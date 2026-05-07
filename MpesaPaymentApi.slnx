@@ -1,0 +1,5 @@
+<Solution>
+  <Folder Name="/App/">
+    <Project Path="App/MpesaPaymentApi.csproj" />
+  </Folder>
+</Solution>
