@@ -12,9 +12,9 @@ public class AppDbContext : DbContext
     {
         modelBuilder.Entity<MpesaTransaction>()
             .HasIndex(e => e.CheckoutRequestID)
-            .IsUnique();
+            .IsUnique()
+            .HasFilter("[CheckoutRequestID] IS NOT NULL");
 
-        
         modelBuilder.Entity<MpesaTransaction>()
             .Property(e => e.Amount)
             .HasPrecision(18, 2);
