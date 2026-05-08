@@ -190,8 +190,69 @@ public class MpesaService : IMpesaService
             {
                 throw new Exception("Invalid token response from M-Pesa.");
             }
-            return tokenResponse.AccessToken;
+            return tokenResponse.AccessToken!; 
 
         });
+    }
+
+
+
+
+
+
+    public async Task<B2cRefundResponse> InitiateB2cRefundAsync(B2cRefundRequest request, CancellationToken cancellationToken = default)
+    {
+        // Verify the original transaction exists and was successful
+        var originalTransaction = await _dbContext.MpesaTransactions
+            .FirstOrDefaultAsync(t => t.CheckoutRequestID == request.OriginalCheckoutRequestId, cancellationToken);
+
+        if (originalTransaction == null)
+            throw new Exception($"Original transaction not found: {request.OriginalCheckoutRequestId}");
+
+        if (originalTransaction.Status != "Success")
+            throw new Exception($"Cannot refund non-successful transaction. Status: {originalTransaction.Status}");
+
+        if (originalTransaction.Amount < request.Amount)
+            throw new Exception($"Refund amount ({request.Amount}) exceeds original payment ({originalTransaction.Amount})");
+
+        var token = await GetAccessTokenAsync(cancellationToken);
+        var timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+
+        // B2C payload for Safaricom
+        var payload = new
+        {
+            InitiatorName = "testapi", // Sandbox initiator name - change for production
+            SecurityCredential = "SAFARICOM_SANDBOX_CREDENTIAL", // Sandbox static value - see note below
+            CommandID = "BusinessPayment", // Or "SalaryPayment" / "PromotionPayment"
+            Amount = request.Amount,
+            PartyA = _options.ShortCode, // Your PayBill/Till
+            PartyB = request.PhoneNumber, // Recipient phone
+            Remarks = request.Reason,
+            QueueTimeOutURL = _options.CallbackUrl,
+            ResultURL = _options.CallbackUrl,
+            Occasion = $"Refund-{request.OriginalCheckoutRequestId}"
+        };
+
+        var jsonContent = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8, "application/json");
+        _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var response = await _httpClient.PostAsync("/mpesa/b2c/v1/paymentrequest", jsonContent, cancellationToken);
+        var responseString = await response.Content.ReadAsStringAsync(cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogError("B2C API Error: {StatusCode} - {Response}", response.StatusCode, responseString);
+            var error = JsonSerializer.Deserialize<MpesaErrorResponse>(responseString, JsonOptions);
+            throw new Exception($"B2C refund failed: {error?.ErrorCode} - {error?.ErrorMessage}");
+        }
+
+        var result = JsonSerializer.Deserialize<B2cRefundResponse>(responseString, JsonOptions);
+        if (result == null) throw new Exception("Failed to deserialize B2C response.");
+
+        // Log the refund attempt
+        _logger.LogInformation("B2C Refund initiated: Original={Original}, Recipient={Phone}, Amount={Amount}, ConversationID={ConvId}",
+            request.OriginalCheckoutRequestId, request.PhoneNumber, request.Amount, result.ConversationID);
+
+        return result;
     }
 }
