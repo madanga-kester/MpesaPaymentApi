@@ -48,10 +48,11 @@ public class MpesaService : IMpesaService
         var token = await GetAccessTokenAsync(cancellationToken);
         var timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
         var password = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ShortCode}{_options.Passkey}{timestamp}"));
+        var normalizedPhone = NormalizePhoneNumber(request.PhoneNumber);
 
         var transaction = new MpesaTransaction
         {
-            PhoneNumber = request.PhoneNumber,
+            PhoneNumber = normalizedPhone,
             Amount = request.Amount,
             AccountReference = request.AccountReference,
             TransactionDesc = request.TransactionDesc,
@@ -70,9 +71,9 @@ public class MpesaService : IMpesaService
             Timestamp = timestamp,
             TransactionType = "CustomerPayBillOnline",
             Amount = request.Amount,
-            PartyA = request.PhoneNumber,
+            PartyA = normalizedPhone,
             PartyB = _options.ShortCode,
-            PhoneNumber = request.PhoneNumber,
+            PhoneNumber = normalizedPhone,
             CallBackURL = _options.CallbackUrl,
             AccountReference = request.AccountReference,
             TransactionDesc = request.TransactionDesc
@@ -88,6 +89,7 @@ public class MpesaService : IMpesaService
         {
             transaction.Status = "Failed";
             transaction.UpdatedAt = DateTime.UtcNow;
+            // Do NOT set CheckoutRequestID here - M-Pesa error responses don't include it
             await _dbContext.SaveChangesAsync(cancellationToken);
 
             _logger.LogError("M-Pesa API Error: {StatusCode} - {Response}", response.StatusCode, responseString);
@@ -98,8 +100,11 @@ public class MpesaService : IMpesaService
         var result = JsonSerializer.Deserialize<MpesaStkPushResponse>(responseString, JsonOptions);
         if (result == null) throw new Exception("Failed to deserialize M-Pesa response.");
 
-        transaction.CheckoutRequestID = result.CheckoutRequestID;
-        transaction.MerchantRequestID = result.MerchantRequestID;
+        if (!string.IsNullOrWhiteSpace(result.CheckoutRequestID))
+        {
+            transaction.CheckoutRequestID = result.CheckoutRequestID;
+            transaction.MerchantRequestID = result.MerchantRequestID;
+        }
         transaction.UpdatedAt = DateTime.UtcNow;
         await _dbContext.SaveChangesAsync(cancellationToken);
 
@@ -178,8 +183,6 @@ public class MpesaService : IMpesaService
             var response = await _httpClient.GetAsync("/oauth/v1/generate?grant_type=client_credentials", cancellationToken);
             var responseString = await response.Content.ReadAsStringAsync(cancellationToken);
 
-            
-
             if (!response.IsSuccessStatusCode)
             {
                 throw new Exception($"Failed to get M-Pesa token: {response.StatusCode} - {responseString}");
@@ -190,19 +193,15 @@ public class MpesaService : IMpesaService
             {
                 throw new Exception("Invalid token response from M-Pesa.");
             }
-            return tokenResponse.AccessToken!; 
+            return tokenResponse.AccessToken!;
 
         });
     }
 
-
-
-
-
-
     public async Task<B2cRefundResponse> InitiateB2cRefundAsync(B2cRefundRequest request, CancellationToken cancellationToken = default)
     {
-        // Verify the original transaction exists and was successful
+        var normalizedPhone = NormalizePhoneNumber(request.PhoneNumber);
+
         var originalTransaction = await _dbContext.MpesaTransactions
             .FirstOrDefaultAsync(t => t.CheckoutRequestID == request.OriginalCheckoutRequestId, cancellationToken);
 
@@ -218,15 +217,14 @@ public class MpesaService : IMpesaService
         var token = await GetAccessTokenAsync(cancellationToken);
         var timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
 
-        // B2C payload for Safaricom
         var payload = new
         {
-            InitiatorName = "testapi", // Sandbox initiator name - change for production
-            SecurityCredential = "SAFARICOM_SANDBOX_CREDENTIAL", // Sandbox static value - see note below
-            CommandID = "BusinessPayment", // Or "SalaryPayment" / "PromotionPayment"
+            InitiatorName = "testapi",
+            SecurityCredential = "SAFARICOM_SANDBOX_CREDENTIAL",
+            CommandID = "BusinessPayment",
             Amount = request.Amount,
-            PartyA = _options.ShortCode, // Your PayBill/Till
-            PartyB = request.PhoneNumber, // Recipient phone
+            PartyA = _options.ShortCode,
+            PartyB = normalizedPhone,
             Remarks = request.Reason,
             QueueTimeOutURL = _options.CallbackUrl,
             ResultURL = _options.CallbackUrl,
@@ -249,10 +247,32 @@ public class MpesaService : IMpesaService
         var result = JsonSerializer.Deserialize<B2cRefundResponse>(responseString, JsonOptions);
         if (result == null) throw new Exception("Failed to deserialize B2C response.");
 
-        // Log the refund attempt
         _logger.LogInformation("B2C Refund initiated: Original={Original}, Recipient={Phone}, Amount={Amount}, ConversationID={ConvId}",
             request.OriginalCheckoutRequestId, request.PhoneNumber, request.Amount, result.ConversationID);
 
         return result;
+    }
+
+    private static string NormalizePhoneNumber(string phoneNumber)
+    {
+        if (string.IsNullOrWhiteSpace(phoneNumber))
+            throw new ArgumentException("Phone number cannot be empty", nameof(phoneNumber));
+
+        var cleaned = phoneNumber.Trim().Replace(" ", "").Replace("-", "").Replace("+", "");
+
+        if (cleaned.StartsWith("07") || cleaned.StartsWith("01"))
+        {
+            return "254" + cleaned.Substring(1);
+        }
+        if (cleaned.StartsWith("254"))
+        {
+            return cleaned;
+        }
+        if (cleaned.StartsWith("7") || cleaned.StartsWith("1"))
+        {
+            return "254" + cleaned;
+        }
+
+        throw new ArgumentException($"Invalid Kenyan phone number format: '{phoneNumber}'. Expected formats: 07XXXXXXXX, +2547XXXXXXXX, or 2547XXXXXXXX", nameof(phoneNumber));
     }
 }

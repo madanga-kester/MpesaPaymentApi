@@ -100,6 +100,22 @@ builder.Services
         options.RequireHttpsMetadata = false;
         options.SaveToken = true;
 
+        //options.TokenValidationParameters = new TokenValidationParameters
+        //{
+        //    ValidateIssuer = true,
+        //    ValidateAudience = true,
+        //    ValidateLifetime = true,
+        //    ValidateIssuerSigningKey = true,
+        //    ValidIssuer = issuer,
+        //    ValidAudience = audience,
+        //    IssuerSigningKey = signingKey,
+        //    ClockSkew = builder.Environment.IsDevelopment()
+        //                                   ? TimeSpan.FromMinutes(5)
+        //                                   : TimeSpan.FromMinutes(1),
+        //    NameClaimType = "sub",
+        //    RoleClaimType = "Role"
+        //};
+
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
@@ -109,12 +125,15 @@ builder.Services
             ValidIssuer = issuer,
             ValidAudience = audience,
             IssuerSigningKey = signingKey,
+            // Critical fix for IDX10503: Resolve key regardless of missing 'kid' header
+            IssuerSigningKeyResolver = (token, securityToken, kid, validationParameters) => new[] { signingKey },
             ClockSkew = builder.Environment.IsDevelopment()
-                                           ? TimeSpan.FromMinutes(5)
-                                           : TimeSpan.FromMinutes(1),
+                                   ? TimeSpan.FromMinutes(5)
+                                   : TimeSpan.FromMinutes(1),
             NameClaimType = "sub",
             RoleClaimType = "Role"
         };
+
 
         options.Events = new JwtBearerEvents
         {

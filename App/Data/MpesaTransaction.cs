@@ -5,7 +5,8 @@ namespace MpesaPaymentApi.Data;
 public class MpesaTransaction
 {
     public int Id { get; set; }
-    public string CheckoutRequestID { get; set; } = string.Empty;
+    //public string CheckoutRequestID { get; set; } = string.Empty;
+    public string? CheckoutRequestID { get; set; }
     public string MerchantRequestID { get; set; } = string.Empty;
     public string PhoneNumber { get; set; } = string.Empty;
     public decimal Amount { get; set; }
