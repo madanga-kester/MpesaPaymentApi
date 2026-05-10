@@ -50,6 +50,8 @@ var signingKey = new SymmetricSecurityKey(keyBytes) { KeyId = fingerprint };
 
 // Services 
 builder.Services.Configure<MpesaOptions>(builder.Configuration.GetSection("Mpesa"));
+builder.Services.AddHostedService<StalePendingTransactionService>();
+
 builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient("MpesaClient", client =>
 {
@@ -159,9 +161,14 @@ builder.Services
                         errorDescription = context.ErrorDescription
                     }));
             },
+
             OnTokenValidated = context =>
             {
-                Console.WriteLine($"[JWT OK] Token validated for: {context.Principal?.Identity?.Name}");
+                var userId = context.Principal?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+                var email = context.Principal?.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
+                var firstName = context.Principal?.FindFirst("FirstName")?.Value;
+                var lastName = context.Principal?.FindFirst("LastName")?.Value;
+                Console.WriteLine($"[JWT OK] Token validated for: {firstName} {lastName} (id={userId}, email={email})");
                 return Task.CompletedTask;
             }
         };

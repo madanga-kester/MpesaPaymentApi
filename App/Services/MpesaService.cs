@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -7,6 +7,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MpesaPaymentApi.Data;
@@ -15,6 +17,67 @@ using MpesaPaymentApi.Models.Dtos;
 
 namespace MpesaPaymentApi.Services;
 
+ 
+public class StalePendingTransactionService : BackgroundService
+{
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<StalePendingTransactionService> _logger;
+    private readonly TimeSpan _interval = TimeSpan.FromMinutes(2);
+    private readonly TimeSpan _staleAfter = TimeSpan.FromMinutes(2);
+
+    public StalePendingTransactionService(
+        IServiceScopeFactory scopeFactory,
+        ILogger<StalePendingTransactionService> logger)
+    {
+        _scopeFactory = scopeFactory;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("[STALE-CHECK] Stale transaction monitor started. Interval={Interval}m, StaleAfter={StaleAfter}m",
+            _interval.TotalMinutes, _staleAfter.TotalMinutes);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await Task.Delay(_interval, stoppingToken);
+
+            try
+            {
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+                var cutoff = DateTime.UtcNow - _staleAfter;
+                var stale = await db.MpesaTransactions
+                    .Where(t => t.Status == "Pending" && t.CreatedAt < cutoff)
+                    .ToListAsync(stoppingToken);
+
+                if (stale.Count == 0) continue;
+
+                foreach (var t in stale)
+                {
+                    t.Status = "Timeout";
+                    t.ResultCode = 1037;
+                    t.ResultDesc = "STK push timed out — no callback received.";
+                    t.UpdatedAt = DateTime.UtcNow;
+                }
+
+                await db.SaveChangesAsync(stoppingToken);
+                _logger.LogWarning("[STALE-CHECK] Marked {Count} stale transaction(s) as Timeout.", stale.Count);
+            }
+            catch (OperationCanceledException)
+            {
+                
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[STALE-CHECK] Error while processing stale transactions.");
+            }
+        }
+    }
+}
+
+//  MpesaService 
 public class MpesaService : IMpesaService
 {
     private readonly HttpClient _httpClient;
@@ -89,7 +152,6 @@ public class MpesaService : IMpesaService
         {
             transaction.Status = "Failed";
             transaction.UpdatedAt = DateTime.UtcNow;
-            // Do NOT set CheckoutRequestID here - M-Pesa error responses don't include it
             await _dbContext.SaveChangesAsync(cancellationToken);
 
             _logger.LogError("M-Pesa API Error: {StatusCode} - {Response}", response.StatusCode, responseString);
@@ -136,9 +198,17 @@ public class MpesaService : IMpesaService
         transaction.CallbackReceivedAt = DateTime.UtcNow;
         transaction.UpdatedAt = DateTime.UtcNow;
 
+        
+        transaction.Status = callback.ResultCode switch
+        {
+            0 => "Success",    // Payment completed
+            1032 => "Cancelled",  // User cancelled the STK prompt
+            1037 => "Timeout",    // STK push timed out on Safaricom's side
+            _ => "Failed"      // Any other error
+        };
+
         if (callback.ResultCode == 0 && callback.CallbackMetadata != null)
         {
-            transaction.Status = "Success";
             foreach (var item in callback.CallbackMetadata.Item)
             {
                 switch (item.Name)
@@ -151,9 +221,7 @@ public class MpesaService : IMpesaService
                         break;
                     case "TransactionDate":
                         if (item.Value != null && long.TryParse(item.Value.ToString(), out long dateVal))
-                        {
                             transaction.TransactionDate = DateTime.ParseExact(dateVal.ToString(), "yyyyMMddHHmmss", null);
-                        }
                         break;
                 }
             }
@@ -162,9 +230,8 @@ public class MpesaService : IMpesaService
         }
         else
         {
-            transaction.Status = callback.ResultCode == 1032 ? "Cancelled" : "Failed";
-            _logger.LogWarning("M-Pesa Payment {Status}. CheckoutID: {CheckoutID} Reason: {Reason}",
-                transaction.Status, callback.CheckoutRequestID, callback.ResultDesc);
+            _logger.LogWarning("M-Pesa Payment {Status} (code={Code}). CheckoutID: {CheckoutID} Reason: {Reason}",
+                transaction.Status, callback.ResultCode, callback.CheckoutRequestID, callback.ResultDesc);
         }
 
         await _dbContext.SaveChangesAsync(cancellationToken);
@@ -184,17 +251,13 @@ public class MpesaService : IMpesaService
             var responseString = await response.Content.ReadAsStringAsync(cancellationToken);
 
             if (!response.IsSuccessStatusCode)
-            {
                 throw new Exception($"Failed to get M-Pesa token: {response.StatusCode} - {responseString}");
-            }
 
             var tokenResponse = JsonSerializer.Deserialize<MpesaTokenResponse>(responseString, JsonOptions);
             if (tokenResponse?.AccessToken == null)
-            {
                 throw new Exception("Invalid token response from M-Pesa.");
-            }
-            return tokenResponse.AccessToken!;
 
+            return tokenResponse.AccessToken!;
         });
     }
 
@@ -215,7 +278,6 @@ public class MpesaService : IMpesaService
             throw new Exception($"Refund amount ({request.Amount}) exceeds original payment ({originalTransaction.Amount})");
 
         var token = await GetAccessTokenAsync(cancellationToken);
-        var timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
 
         var payload = new
         {
@@ -261,18 +323,16 @@ public class MpesaService : IMpesaService
         var cleaned = phoneNumber.Trim().Replace(" ", "").Replace("-", "").Replace("+", "");
 
         if (cleaned.StartsWith("07") || cleaned.StartsWith("01"))
-        {
             return "254" + cleaned.Substring(1);
-        }
-        if (cleaned.StartsWith("254"))
-        {
-            return cleaned;
-        }
-        if (cleaned.StartsWith("7") || cleaned.StartsWith("1"))
-        {
-            return "254" + cleaned;
-        }
 
-        throw new ArgumentException($"Invalid Kenyan phone number format: '{phoneNumber}'. Expected formats: 07XXXXXXXX, +2547XXXXXXXX, or 2547XXXXXXXX", nameof(phoneNumber));
+        if (cleaned.StartsWith("254"))
+            return cleaned;
+
+        if (cleaned.StartsWith("7") || cleaned.StartsWith("1"))
+            return "254" + cleaned;
+
+        throw new ArgumentException(
+            $"Invalid Kenyan phone number format: '{phoneNumber}'. Expected formats: 07XXXXXXXX, +2547XXXXXXXX, or 2547XXXXXXXX",
+            nameof(phoneNumber));
     }
 }
