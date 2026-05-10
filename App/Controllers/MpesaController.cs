@@ -9,8 +9,7 @@ namespace MpesaPaymentApi.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-// [Authorize] ← REMOVED: M-Pesa is an internal service; Safaricom auth is
-//               handled server-side. Your main API handles user auth.
+[Authorize] 
 public class MpesaController : ControllerBase
 {
     private readonly IMpesaService _mpesaService;
@@ -27,11 +26,13 @@ public class MpesaController : ControllerBase
         _logger = logger;
     }
 
+    //  STK Push 
+
     [HttpPost("stkpush")]
     public async Task<IActionResult> InitiateStkPush([FromBody] StkPushRequest request, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.PhoneNumber) || request.Amount <= 0)
-            return BadRequest("Invalid phone number or amount.");
+            return BadRequest(new { Error = "Invalid phone number or amount." });
 
         try
         {
@@ -45,6 +46,8 @@ public class MpesaController : ControllerBase
         }
     }
 
+    //  Transactions 
+
     [HttpGet("transactions")]
     public async Task<IActionResult> GetTransactions(
         [FromQuery] int page = 1,
@@ -53,6 +56,9 @@ public class MpesaController : ControllerBase
         [FromQuery] string? status = null,
         CancellationToken ct = default)
     {
+        if (page < 1) page = 1;
+        if (pageSize < 1 || pageSize > 100) pageSize = 20;
+
         var query = _dbContext.MpesaTransactions.AsQueryable();
 
         if (!string.IsNullOrWhiteSpace(phoneNumber))
@@ -90,7 +96,7 @@ public class MpesaController : ControllerBase
         });
     }
 
-    [HttpGet("transactions/{id}")]
+    [HttpGet("transactions/{id:int}")]
     public async Task<IActionResult> GetTransaction(int id, CancellationToken ct)
     {
         var transaction = await _dbContext.MpesaTransactions
@@ -98,7 +104,7 @@ public class MpesaController : ControllerBase
             .FirstOrDefaultAsync(t => t.Id == id, ct);
 
         if (transaction == null)
-            return NotFound(new { Error = "Transaction not found" });
+            return NotFound(new { Error = "Transaction not found." });
 
         return Ok(new
         {
@@ -128,18 +134,23 @@ public class MpesaController : ControllerBase
             .FirstOrDefaultAsync(t => t.CheckoutRequestID == checkoutRequestId, ct);
 
         if (transaction == null)
-            return NotFound(new { Error = "Transaction not found" });
+            return NotFound(new { Error = "Transaction not found." });
 
         return Ok(new
         {
             transaction.Id,
             transaction.CheckoutRequestID,
             transaction.Status,
+            transaction.ResultCode,
+            transaction.ResultDesc,
             transaction.Amount,
             transaction.MpesaReceiptNumber,
-            transaction.CreatedAt
+            transaction.CreatedAt,
+            transaction.UpdatedAt
         });
     }
+
+    //  Refund 
 
     [HttpPost("refund")]
     [ProducesResponseType(typeof(B2cRefundResponse), StatusCodes.Status200OK)]
@@ -148,10 +159,10 @@ public class MpesaController : ControllerBase
     public async Task<IActionResult> InitiateRefund([FromBody] B2cRefundRequest request, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.PhoneNumber) || request.Amount <= 0)
-            return BadRequest("Invalid phone number or amount.");
+            return BadRequest(new { Error = "Invalid phone number or amount." });
 
         if (string.IsNullOrWhiteSpace(request.OriginalCheckoutRequestId))
-            return BadRequest("OriginalCheckoutRequestId is required.");
+            return BadRequest(new { Error = "OriginalCheckoutRequestId is required." });
 
         try
         {
@@ -165,69 +176,16 @@ public class MpesaController : ControllerBase
         }
     }
 
-    [HttpGet("debug/auth")]
-    [AllowAnonymous]
-    public IActionResult DebugAuth([FromServices] IConfiguration config)
-    {
-        var jwt = config.GetSection("JwtSettings");
-        var isAuth = User?.Identity?.IsAuthenticated == true;
-        var claims = isAuth
-            ? User!.Claims.Select(c => new { type = c.Type, value = c.Value }).ToList<object>()
-            : new List<object>();
-
-        return Ok(new
-        {
-            secretKeyLoaded = !string.IsNullOrEmpty(jwt["SecretKey"]),
-            secretKeyLength = jwt["SecretKey"]?.Length ?? 0,
-            issuer = jwt["Issuer"],
-            audience = jwt["Audience"],
-            isAuthenticated = isAuth,
-            claims
-        });
-    }
-
-    [HttpGet("debug/header")]
-    [AllowAnonymous]
-    public IActionResult DebugHeader([FromServices] IHttpContextAccessor httpContextAccessor)
-    {
-        var authHeader = httpContextAccessor.HttpContext?.Request.Headers["Authorization"].ToString();
-        return Ok(new { authorizationHeader = authHeader, headerLength = authHeader?.Length ?? 0 });
-    }
-
-
-
-
-
-
-
-    //[HttpPost("callback")]
-    //[AllowAnonymous] // Critical: Safaricom servers must reach this without authentication
-    //public async Task<IActionResult> HandleMpesaCallback([FromBody] MpesaCallbackPayload payload, CancellationToken ct)
-    //{
-    //    try
-    //    {
-    //        var result = await _mpesaService.ValidateCallbackAsync(payload, ct);
-    //        return result ? Ok(new { status = "received" }) : BadRequest(new { error = "Invalid callback payload" });
-    //    }
-    //    catch (Exception ex)
-    //    {
-    //        _logger.LogError(ex, "Callback processing failed");
-    //        // Return 200 anyway to prevent Safaricom from retrying endlessly
-    //        return Ok(new { status = "error_logged" });
-    //    }
-    //}
-
+    //  Callback (Safaricom  this API, no auth)
 
     [HttpPost("callback")]
-    [AllowAnonymous]
+    [AllowAnonymous] 
     public async Task<IActionResult> HandleMpesaCallback([FromBody] MpesaCallbackPayload payload, CancellationToken ct)
     {
         try
         {
-            _logger.LogInformation("Callback received: {@Payload}", payload);
-
+            _logger.LogInformation("M-Pesa callback received: {@Payload}", payload);
             var result = await _mpesaService.ValidateCallbackAsync(payload, ct);
-
             return result
                 ? Ok(new { status = "received" })
                 : BadRequest(new { error = "Invalid callback payload" });
@@ -235,10 +193,8 @@ public class MpesaController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Callback processing failed");
-            // Always return 200 to prevent Safaricom from retrying endlessly
+            
             return Ok(new { status = "error_logged" });
         }
     }
-
-
 }
