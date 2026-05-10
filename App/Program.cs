@@ -13,13 +13,11 @@ IdentityModelEventSource.LogCompleteSecurityArtifact = true;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ── Configuration ────────────────────────────────────────────────────────────
 builder.Configuration
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
     .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true, reloadOnChange: true)
     .AddEnvironmentVariables();
 
-// ── DEBUG: Confirm config is loading correctly ────────────────────────────────
 Console.WriteLine($"[CONFIG] ContentRootPath : {builder.Environment.ContentRootPath}");
 Console.WriteLine($"[CONFIG] Environment     : {builder.Environment.EnvironmentName}");
 
@@ -32,7 +30,7 @@ Console.WriteLine($"[JWT] SecretKey loaded   : {(string.IsNullOrEmpty(secretKey)
 Console.WriteLine($"[JWT] Issuer             : {issuer ?? "❌ NULL"}");
 Console.WriteLine($"[JWT] Audience           : {audience ?? "❌ NULL"}");
 
-// Hard-fail on startup if JWT config is missing — far better than silent 401s
+
 if (string.IsNullOrWhiteSpace(secretKey))
     throw new InvalidOperationException(
         "[FATAL] JwtSettings:SecretKey is missing or empty. " +
@@ -48,11 +46,9 @@ var keyBytes = Encoding.UTF8.GetBytes(secretKey);
 var fingerprint = Convert.ToHexString(SHA256.HashData(keyBytes))[..8];
 Console.WriteLine($"[JWT] Key fingerprint    : {fingerprint} (must match main API)");
 
-// Fix for Microsoft.IdentityModel bug: SymmetricSecurityKey must have a KeyId
-// set or newer versions of the library fail to match it against keyless tokens.
 var signingKey = new SymmetricSecurityKey(keyBytes) { KeyId = fingerprint };
 
-// ── Services ─────────────────────────────────────────────────────────────────
+// Services 
 builder.Services.Configure<MpesaOptions>(builder.Configuration.GetSection("Mpesa"));
 builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient("MpesaClient", client =>
@@ -87,7 +83,7 @@ builder.Services.AddCors(options =>
 builder.Services.AddControllers();
 builder.Services.AddHttpContextAccessor();
 
-// ── JWT Authentication ────────────────────────────────────────────────────────
+//  JWT Authentication 
 builder.Services
     .AddAuthentication(options =>
     {
@@ -100,21 +96,8 @@ builder.Services
         options.RequireHttpsMetadata = false;
         options.SaveToken = true;
 
-        //options.TokenValidationParameters = new TokenValidationParameters
-        //{
-        //    ValidateIssuer = true,
-        //    ValidateAudience = true,
-        //    ValidateLifetime = true,
-        //    ValidateIssuerSigningKey = true,
-        //    ValidIssuer = issuer,
-        //    ValidAudience = audience,
-        //    IssuerSigningKey = signingKey,
-        //    ClockSkew = builder.Environment.IsDevelopment()
-        //                                   ? TimeSpan.FromMinutes(5)
-        //                                   : TimeSpan.FromMinutes(1),
-        //    NameClaimType = "sub",
-        //    RoleClaimType = "Role"
-        //};
+
+
 
         options.TokenValidationParameters = new TokenValidationParameters
         {
@@ -125,14 +108,19 @@ builder.Services
             ValidIssuer = issuer,
             ValidAudience = audience,
             IssuerSigningKey = signingKey,
-            // Critical fix for IDX10503: Resolve key regardless of missing 'kid' header
+          
             IssuerSigningKeyResolver = (token, securityToken, kid, validationParameters) => new[] { signingKey },
+            
+
             ClockSkew = builder.Environment.IsDevelopment()
                                    ? TimeSpan.FromMinutes(5)
                                    : TimeSpan.FromMinutes(1),
             NameClaimType = "sub",
             RoleClaimType = "Role"
         };
+
+
+
 
 
         options.Events = new JwtBearerEvents
@@ -142,8 +130,18 @@ builder.Services
                 var exType = context.Exception.GetType().Name;
                 Console.WriteLine($"[JWT FAIL] {exType}: {context.Exception.Message}");
 
-                if (context.Exception is SecurityTokenExpiredException)
+                var inner = context.Exception.InnerException;
+                while (inner != null)
+                {
+                    Console.WriteLine($"[JWT FAIL INNER] {inner.GetType().Name}: {inner.Message}");
+                    inner = inner.InnerException;
+                }
+
+                if (context.Exception is SecurityTokenExpiredException ex)
+                {
+                    Console.WriteLine($"[JWT EXPIRED] Token expired at: {ex.Expires} (UTC now: {DateTime.UtcNow})");
                     context.Response.Headers.Append("Token-Expired", "true");
+                }
 
                 return Task.CompletedTask;
             },
@@ -171,7 +169,7 @@ builder.Services
 
 builder.Services.AddAuthorization();
 
-// ── Pipeline ──────────────────────────────────────────────────────────────────
+
 var app = builder.Build();
 
 if (app.Environment.IsDevelopment())
@@ -186,7 +184,7 @@ if (!app.Environment.IsDevelopment())
     app.UseHttpsRedirection();
 
 app.UseCors("AllowFrontend");
-app.UseAuthentication();   // ← must be before UseAuthorization
+app.UseAuthentication();   
 app.UseAuthorization();
 app.MapControllers();
 

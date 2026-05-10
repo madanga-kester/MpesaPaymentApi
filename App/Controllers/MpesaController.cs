@@ -193,4 +193,52 @@ public class MpesaController : ControllerBase
         var authHeader = httpContextAccessor.HttpContext?.Request.Headers["Authorization"].ToString();
         return Ok(new { authorizationHeader = authHeader, headerLength = authHeader?.Length ?? 0 });
     }
+
+
+
+
+
+
+
+    //[HttpPost("callback")]
+    //[AllowAnonymous] // Critical: Safaricom servers must reach this without authentication
+    //public async Task<IActionResult> HandleMpesaCallback([FromBody] MpesaCallbackPayload payload, CancellationToken ct)
+    //{
+    //    try
+    //    {
+    //        var result = await _mpesaService.ValidateCallbackAsync(payload, ct);
+    //        return result ? Ok(new { status = "received" }) : BadRequest(new { error = "Invalid callback payload" });
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        _logger.LogError(ex, "Callback processing failed");
+    //        // Return 200 anyway to prevent Safaricom from retrying endlessly
+    //        return Ok(new { status = "error_logged" });
+    //    }
+    //}
+
+
+    [HttpPost("callback")]
+    [AllowAnonymous]
+    public async Task<IActionResult> HandleMpesaCallback([FromBody] MpesaCallbackPayload payload, CancellationToken ct)
+    {
+        try
+        {
+            _logger.LogInformation("Callback received: {@Payload}", payload);
+
+            var result = await _mpesaService.ValidateCallbackAsync(payload, ct);
+
+            return result
+                ? Ok(new { status = "received" })
+                : BadRequest(new { error = "Invalid callback payload" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Callback processing failed");
+            // Always return 200 to prevent Safaricom from retrying endlessly
+            return Ok(new { status = "error_logged" });
+        }
+    }
+
+
 }
