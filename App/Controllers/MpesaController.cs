@@ -1,5 +1,6 @@
 ﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using MpesaPaymentApi.Data;
 using MpesaPaymentApi.Models.Dtos;
@@ -9,21 +10,40 @@ namespace MpesaPaymentApi.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-[Authorize] 
+[Authorize]
 public class MpesaController : ControllerBase
 {
     private readonly IMpesaService _mpesaService;
     private readonly AppDbContext _dbContext;
     private readonly ILogger<MpesaController> _logger;
+    private readonly HashSet<string> _knownClientIds;
 
     public MpesaController(
         IMpesaService mpesaService,
         AppDbContext dbContext,
-        ILogger<MpesaController> logger)
+        ILogger<MpesaController> logger,
+        Microsoft.Extensions.Options.IOptions<MpesaPaymentApi.Models.Configuration.ClientAppOptions> clientAppOptions)
     {
         _mpesaService = mpesaService;
         _dbContext = dbContext;
         _logger = logger;
+        _knownClientIds = clientAppOptions.Value.Apps.Select(a => a.ClientId).ToHashSet();
+    }
+
+    private IActionResult? ValidateClientId(out string clientId)
+    {
+        clientId = Request.Headers["X-Client-Id"].ToString();
+
+        if (string.IsNullOrWhiteSpace(clientId))
+            return BadRequest(new { Error = "X-Client-Id header is required." });
+
+        if (!_knownClientIds.Contains(clientId))
+        {
+            _logger.LogWarning("Request received with unrecognized client id: {ClientId}", clientId);
+            return BadRequest(new { Error = "Unrecognized client application." });
+        }
+
+        return null;
     }
 
     //  STK Push 
@@ -31,41 +51,48 @@ public class MpesaController : ControllerBase
     [HttpPost("stkpush")]
     public async Task<IActionResult> InitiateStkPush([FromBody] StkPushRequest request, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(request.PhoneNumber) || request.Amount <= 0)
-            return BadRequest(new { Error = "Invalid phone number or amount." });
+        if (!ModelState.IsValid)
+            return ValidationProblem(ModelState);
 
-        try
-        {
-            var response = await _mpesaService.SendStkPushAsync(request, ct);
-            return Ok(response);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "STK push failed for {Phone}", request.PhoneNumber);
-            return StatusCode(500, new { Error = ex.Message });
-        }
+        var clientIdError = ValidateClientId(out var clientId);
+        if (clientIdError != null) return clientIdError;
+
+        var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        var response = await _mpesaService.SendStkPushAsync(request, userId, clientId, ct);
+        return Ok(response);
     }
 
     //  Transactions 
-
     [HttpGet("transactions")]
     public async Task<IActionResult> GetTransactions(
-        [FromQuery] int page = 1,
-        [FromQuery] int pageSize = 20,
-        [FromQuery] string? phoneNumber = null,
-        [FromQuery] string? status = null,
-        CancellationToken ct = default)
+              [FromQuery] int page = 1,
+              [FromQuery] int pageSize = 20,
+              [FromQuery] string? phoneNumber = null,
+              [FromQuery] string? status = null,
+              [FromQuery] string? originClientId = null,
+              CancellationToken ct = default)
     {
         if (page < 1) page = 1;
         if (pageSize < 1 || pageSize > 100) pageSize = 20;
 
         var query = _dbContext.MpesaTransactions.AsQueryable();
 
+        // Row-level scoping: non-admins only ever see their own transactions,
+        // regardless of what filters they pass in the query string.
+        if (!User.IsInRole("Admin"))
+        {
+            var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+            query = query.Where(t => t.UserId == userId);
+        }
+
         if (!string.IsNullOrWhiteSpace(phoneNumber))
             query = query.Where(t => t.PhoneNumber == phoneNumber);
 
         if (!string.IsNullOrWhiteSpace(status))
             query = query.Where(t => t.Status == status);
+
+        if (!string.IsNullOrWhiteSpace(originClientId))
+            query = query.Where(t => t.OriginClientId == originClientId);
 
         var total = await query.CountAsync(ct);
         var items = await query
@@ -81,6 +108,7 @@ public class MpesaController : ControllerBase
                 t.Status,
                 t.ResultCode,
                 t.MpesaReceiptNumber,
+                t.OriginClientId,
                 t.CreatedAt,
                 t.UpdatedAt
             })
@@ -99,13 +127,18 @@ public class MpesaController : ControllerBase
     [HttpGet("transactions/{id:int}")]
     public async Task<IActionResult> GetTransaction(int id, CancellationToken ct)
     {
-        var transaction = await _dbContext.MpesaTransactions
-            .AsNoTracking()
-            .FirstOrDefaultAsync(t => t.Id == id, ct);
+        var query = _dbContext.MpesaTransactions.AsNoTracking().Where(t => t.Id == id);
+
+        if (!User.IsInRole("Admin"))
+        {
+            var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+            query = query.Where(t => t.UserId == userId);
+        }
+
+        var transaction = await query.FirstOrDefaultAsync(ct);
 
         if (transaction == null)
             return NotFound(new { Error = "Transaction not found." });
-
         return Ok(new
         {
             transaction.Id,
@@ -119,6 +152,7 @@ public class MpesaController : ControllerBase
             transaction.ResultCode,
             transaction.ResultDesc,
             transaction.MpesaReceiptNumber,
+            transaction.OriginClientId,
             transaction.TransactionDate,
             transaction.CallbackReceivedAt,
             transaction.CreatedAt,
@@ -129,13 +163,18 @@ public class MpesaController : ControllerBase
     [HttpGet("transactions/checkout/{checkoutRequestId}")]
     public async Task<IActionResult> GetTransactionByCheckoutId(string checkoutRequestId, CancellationToken ct)
     {
-        var transaction = await _dbContext.MpesaTransactions
-            .AsNoTracking()
-            .FirstOrDefaultAsync(t => t.CheckoutRequestID == checkoutRequestId, ct);
+        var query = _dbContext.MpesaTransactions.AsNoTracking().Where(t => t.CheckoutRequestID == checkoutRequestId);
+
+        if (!User.IsInRole("Admin"))
+        {
+            var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+            query = query.Where(t => t.UserId == userId);
+        }
+
+        var transaction = await query.FirstOrDefaultAsync(ct);
 
         if (transaction == null)
             return NotFound(new { Error = "Transaction not found." });
-
         return Ok(new
         {
             transaction.Id,
@@ -145,56 +184,47 @@ public class MpesaController : ControllerBase
             transaction.ResultDesc,
             transaction.Amount,
             transaction.MpesaReceiptNumber,
+            transaction.OriginClientId,
             transaction.CreatedAt,
             transaction.UpdatedAt
         });
     }
 
     //  Refund 
-
     [HttpPost("refund")]
+    [Authorize(Policy = "FinanceOps")]
     [ProducesResponseType(typeof(B2cRefundResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
     public async Task<IActionResult> InitiateRefund([FromBody] B2cRefundRequest request, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(request.PhoneNumber) || request.Amount <= 0)
-            return BadRequest(new { Error = "Invalid phone number or amount." });
+        if (!ModelState.IsValid)
+            return ValidationProblem(ModelState);
 
-        if (string.IsNullOrWhiteSpace(request.OriginalCheckoutRequestId))
-            return BadRequest(new { Error = "OriginalCheckoutRequestId is required." });
+        var clientIdError = ValidateClientId(out var clientId);
+        if (clientIdError != null) return clientIdError;
 
-        try
-        {
-            var response = await _mpesaService.InitiateB2cRefundAsync(request, ct);
-            return Ok(response);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Refund failed for CheckoutRequestID: {CheckoutID}", request.OriginalCheckoutRequestId);
-            return StatusCode(500, new { Error = ex.Message });
-        }
+        var response = await _mpesaService.InitiateB2cRefundAsync(request, clientId, ct);
+        return Ok(response);
     }
-
     //  Callback (Safaricom  this API, no auth)
-
     [HttpPost("callback")]
-    [AllowAnonymous] 
+    [AllowAnonymous]
+    [EnableRateLimiting("callback")]
     public async Task<IActionResult> HandleMpesaCallback([FromBody] MpesaCallbackPayload payload, CancellationToken ct)
     {
-        try
+        _logger.LogDebug("M-Pesa callback received for CheckoutRequestID {CheckoutId}",
+            payload?.Body?.StkCallback?.CheckoutRequestID);
+
+        if (payload == null)
         {
-            _logger.LogInformation("M-Pesa callback received: {@Payload}", payload);
-            var result = await _mpesaService.ValidateCallbackAsync(payload, ct);
-            return result
-                ? Ok(new { status = "received" })
-                : BadRequest(new { error = "Invalid callback payload" });
+            _logger.LogWarning("M-Pesa callback received with null body.");
+            return Ok(new { ResultCode = 1, ResultDesc = "Rejected" });
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Callback processing failed");
-            
-            return Ok(new { status = "error_logged" });
-        }
+
+        var result = await _mpesaService.ValidateCallbackAsync(payload, ct);
+        return result
+            ? Ok(new { ResultCode = 0, ResultDesc = "Accepted" })
+            : Ok(new { ResultCode = 1, ResultDesc = "Rejected" }); // Safaricom expects 200 either way; retries on non-2xx
     }
 }

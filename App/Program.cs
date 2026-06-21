@@ -1,89 +1,159 @@
 ﻿using System.Text;
 using System.Security.Cryptography;
+using System.Security.Claims;
+using System.Threading.RateLimiting;
 using MpesaPaymentApi.Data;
 using MpesaPaymentApi.Models.Configuration;
 using MpesaPaymentApi.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.IdentityModel.Logging;
-
-IdentityModelEventSource.ShowPII = true;
-IdentityModelEventSource.LogCompleteSecurityArtifact = true;
+using Serilog;
+using MpesaPaymentApi.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// PII/security-artifact logging is ONLY ever enabled in Development, and only
+// via explicit code here — never a blanket switch that could survive into prod.
+IdentityModelEventSource.ShowPII = builder.Environment.IsDevelopment();
+IdentityModelEventSource.LogCompleteSecurityArtifact = false; // never log raw tokens, even in dev
+
+builder.Host.UseSerilog((context, services, loggerConfig) => loggerConfig
+    .ReadFrom.Configuration(context.Configuration)
+    .Enrich.FromLogContext()
+    .WriteTo.Console());
 builder.Configuration
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-    .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true, reloadOnChange: true)
-    .AddEnvironmentVariables();
+    .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true, reloadOnChange: true);
 
-Console.WriteLine($"[CONFIG] ContentRootPath : {builder.Environment.ContentRootPath}");
-Console.WriteLine($"[CONFIG] Environment     : {builder.Environment.EnvironmentName}");
+if (builder.Environment.IsDevelopment())
+    builder.Configuration.AddUserSecrets<Program>();
+
+builder.Configuration.AddEnvironmentVariables();
+
+Log.Information("Starting up in {Environment} environment", builder.Environment.EnvironmentName);
 
 var jwtSettings = builder.Configuration.GetSection("JwtSettings");
 var secretKey = jwtSettings["SecretKey"];
 var issuer = jwtSettings["Issuer"];
 var audience = jwtSettings["Audience"];
+var accessTokenExpiryMinutes = jwtSettings.GetValue("AccessTokenExpiryMinutes", 15);
 
-Console.WriteLine($"[JWT] SecretKey loaded   : {(string.IsNullOrEmpty(secretKey) ? "❌ NULL / EMPTY" : $"✅ length={secretKey.Length}")}");
-Console.WriteLine($"[JWT] Issuer             : {issuer ?? "❌ NULL"}");
-Console.WriteLine($"[JWT] Audience           : {audience ?? "❌ NULL"}");
-
-
-if (string.IsNullOrWhiteSpace(secretKey))
+if (string.IsNullOrWhiteSpace(secretKey) || secretKey.Length < 32)
     throw new InvalidOperationException(
-        "[FATAL] JwtSettings:SecretKey is missing or empty. " +
-        $"Check appsettings.json at: {builder.Environment.ContentRootPath}");
+        "JwtSettings:SecretKey is missing or shorter than 32 characters. Set it via user-secrets or environment variables, never in committed config.");
 
 if (string.IsNullOrWhiteSpace(issuer))
-    throw new InvalidOperationException("[FATAL] JwtSettings:Issuer is missing or empty.");
+    throw new InvalidOperationException("JwtSettings:Issuer is missing or empty.");
 
 if (string.IsNullOrWhiteSpace(audience))
-    throw new InvalidOperationException("[FATAL] JwtSettings:Audience is missing or empty.");
+    throw new InvalidOperationException("JwtSettings:Audience is missing or empty.");
 
 var keyBytes = Encoding.UTF8.GetBytes(secretKey);
-var fingerprint = Convert.ToHexString(SHA256.HashData(keyBytes))[..8];
-Console.WriteLine($"[JWT] Key fingerprint    : {fingerprint} (must match main API)");
+var signingKey = new SymmetricSecurityKey(keyBytes);
 
-var signingKey = new SymmetricSecurityKey(keyBytes) { KeyId = fingerprint };
 
 // Services 
 builder.Services.Configure<MpesaOptions>(builder.Configuration.GetSection("Mpesa"));
+builder.Services.Configure<MpesaPaymentApi.Models.Configuration.ClientAppOptions>(builder.Configuration.GetSection("ClientApps"));
 builder.Services.AddHostedService<StalePendingTransactionService>();
 
+// Background queue for long-running work (refunds, notifications) so requests
+// never block on slow downstream calls — see CallbackQueueProcessor below.
+builder.Services.AddSingleton<MpesaCallbackQueue>();
+builder.Services.AddHostedService<MpesaCallbackQueueProcessor>();
+
 builder.Services.AddMemoryCache();
+
 builder.Services.AddHttpClient("MpesaClient", client =>
 {
-    var baseUrl = builder.Configuration["Mpesa:BaseUrl"] ?? "https://sandbox.safaricom.co.ke";
+    var baseUrl = builder.Configuration["Mpesa:BaseUrl"];
+    if (string.IsNullOrWhiteSpace(baseUrl))
+        throw new InvalidOperationException("Mpesa:BaseUrl is not configured.");
     client.BaseAddress = new Uri(baseUrl);
-});
-builder.Services.AddDbContext<AppDbContext>(options =>
+    client.Timeout = TimeSpan.FromSeconds(30);
+})
+.AddStandardResilienceHandler(); // retry + circuit breaker + timeout against Safaricom's API
+
+builder.Services.AddDbContextPool<AppDbContext>(options =>
     options.UseSqlServer(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-        sql => sql.EnableRetryOnFailure()));
+        sql =>
+        {
+            sql.EnableRetryOnFailure(maxRetryCount: 3, maxRetryDelay: TimeSpan.FromSeconds(5), errorNumbersToAdd: null);
+            sql.CommandTimeout(30);
+        }));
+
+
 builder.Services.AddScoped<IMpesaService, MpesaService>();
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    // Partitioned by X-Client-Id (falling back to IP) so one frontend's traffic
+    // spike can't exhaust the shared limit and 429 every other frontend's users.
+    options.AddPolicy("api", httpContext =>
+    {
+        var clientId = httpContext.Request.Headers["X-Client-Id"].ToString();
+        var partitionKey = !string.IsNullOrWhiteSpace(clientId)
+            ? clientId
+            : httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+        return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = builder.Configuration.GetValue("RateLimiting:PermitLimit", 20),
+            Window = TimeSpan.FromSeconds(builder.Configuration.GetValue("RateLimiting:WindowSeconds", 10)),
+            QueueLimit = 0
+        });
+    });
+
+    options.AddFixedWindowLimiter("callback", limiterOptions =>
+    {
+        // Safaricom's callback endpoint gets a looser, IP-scoped limit since it's [AllowAnonymous]
+        limiterOptions.PermitLimit = 60;
+        limiterOptions.Window = TimeSpan.FromMinutes(1);
+        limiterOptions.QueueLimit = 0;
+    });
+});
+
+builder.Services.AddHealthChecks()
+    .AddSqlServer(
+        builder.Configuration.GetConnectionString("DefaultConnection")!,
+        name: "sqlserver",
+        tags: new[] { "ready" });
+
+var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
+    ?? new[]
+    {
+        "http://localhost:4200",
+        "http://127.0.0.1:4200",
+        "http://localhost:5173",
+        "https://linkup254.com",
+        "https://www.linkup254.com"
+    };
 
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
         policy
-            .WithOrigins(
-                "http://localhost:4200",
-                "http://127.0.0.1:4200",
-                "http://localhost:5173",
-                "https://linkup254.com",
-                "https://www.linkup254.com")
-            .AllowAnyHeader()
-            .AllowAnyMethod()
+            .WithOrigins(allowedOrigins)
+            .WithHeaders("Content-Type", "Authorization", "X-Client-Id")
+            .WithMethods("GET", "POST", "PUT", "DELETE")
             .AllowCredentials()
             .SetPreflightMaxAge(TimeSpan.FromHours(1));
     });
 });
 
-builder.Services.AddControllers();
+builder.Services.AddControllers()
+    .AddJsonOptions(o => o.JsonSerializerOptions.DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull);
+
+builder.Services.AddProblemDetails(); // RFC 7807 structured error responses
 builder.Services.AddHttpContextAccessor();
+// API versioning deferred — add Asp.Versioning.Mvc package and builder.Services.AddApiVersioning() when you have a breaking change to ship.
 
 //  JWT Authentication 
 builder.Services
@@ -98,9 +168,6 @@ builder.Services
         options.RequireHttpsMetadata = false;
         options.SaveToken = true;
 
-
-
-
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
@@ -110,89 +177,100 @@ builder.Services
             ValidIssuer = issuer,
             ValidAudience = audience,
             IssuerSigningKey = signingKey,
-          
+
             IssuerSigningKeyResolver = (token, securityToken, kid, validationParameters) => new[] { signingKey },
-            
 
             ClockSkew = builder.Environment.IsDevelopment()
                                    ? TimeSpan.FromMinutes(5)
-                                   : TimeSpan.FromMinutes(1),
+                                   : TimeSpan.FromSeconds(30),
             NameClaimType = "sub",
-            RoleClaimType = "Role"
+            RoleClaimType = ClaimTypes.Role
         };
-
-
-
-
 
         options.Events = new JwtBearerEvents
         {
             OnAuthenticationFailed = context =>
             {
-                var exType = context.Exception.GetType().Name;
-                Console.WriteLine($"[JWT FAIL] {exType}: {context.Exception.Message}");
+                var logger = context.HttpContext.RequestServices
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("JwtAuthentication");
 
-                var inner = context.Exception.InnerException;
-                while (inner != null)
-                {
-                    Console.WriteLine($"[JWT FAIL INNER] {inner.GetType().Name}: {inner.Message}");
-                    inner = inner.InnerException;
-                }
+                logger.LogWarning(context.Exception, "JWT authentication failed: {ExceptionType}", context.Exception.GetType().Name);
 
-                if (context.Exception is SecurityTokenExpiredException ex)
-                {
-                    Console.WriteLine($"[JWT EXPIRED] Token expired at: {ex.Expires} (UTC now: {DateTime.UtcNow})");
+                if (context.Exception is SecurityTokenExpiredException)
                     context.Response.Headers.Append("Token-Expired", "true");
-                }
 
                 return Task.CompletedTask;
             },
             OnChallenge = context =>
             {
-                Console.WriteLine($"[JWT CHALLENGE] error={context.Error} | desc={context.ErrorDescription}");
+                var logger = context.HttpContext.RequestServices
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("JwtAuthentication");
+                logger.LogInformation("JWT challenge issued: {Error}", context.Error);
+
                 context.HandleResponse();
                 context.Response.StatusCode = 401;
                 context.Response.ContentType = "application/json";
                 return context.Response.WriteAsync(
                     System.Text.Json.JsonSerializer.Serialize(new
                     {
-                        message = "Authentication failed",
-                        error = context.Error,
-                        errorDescription = context.ErrorDescription
+                        message = "Authentication failed"
                     }));
             },
 
             OnTokenValidated = context =>
             {
-                var userId = context.Principal?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
-                var email = context.Principal?.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value;
-                var firstName = context.Principal?.FindFirst("FirstName")?.Value;
-                var lastName = context.Principal?.FindFirst("LastName")?.Value;
-                Console.WriteLine($"[JWT OK] Token validated for: {firstName} {lastName} (id={userId}, email={email})");
+                var logger = context.HttpContext.RequestServices
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("JwtAuthentication");
+                var userId = context.Principal?.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+                logger.LogDebug("JWT validated for user {UserId}", userId);
                 return Task.CompletedTask;
             }
         };
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorizationBuilder()
+    .AddPolicy("AdminOnly", policy => policy.RequireRole("Admin"))
+    .AddPolicy("FinanceOps", policy => policy.RequireRole("Admin", "FinanceOps"));
 
 
 var app = builder.Build();
 
-if (app.Environment.IsDevelopment())
-    app.UseDeveloperExceptionPage();
-else
-{
-    app.UseExceptionHandler("/error");
-    app.UseHsts();
-}
+// Centralized exception handling — replaces the dev exception page entirely so
+// behavior is identical in shape between environments (only verbosity differs).
+app.UseMiddleware<GlobalExceptionMiddleware>();
 
 if (!app.Environment.IsDevelopment())
+{
+    app.UseHsts();
     app.UseHttpsRedirection();
+}
 
 app.UseCors("AllowFrontend");
-app.UseAuthentication();   
-app.UseAuthorization();
-app.MapControllers();
 
-app.Run();
+app.UseRateLimiter();
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers().RequireRateLimiting("api");
+
+app.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+{
+    Predicate = _ => false // liveness: just "is the process up", no dependency checks
+});
+app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready") // readiness: DB reachable
+});
+
+try
+{
+    app.Run();
+}
+finally
+{
+    Log.CloseAndFlush();
+}

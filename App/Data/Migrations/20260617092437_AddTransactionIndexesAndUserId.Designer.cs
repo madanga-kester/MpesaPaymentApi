@@ -3,6 +3,7 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using MpesaPaymentApi.Data;
 
@@ -11,9 +12,11 @@ using MpesaPaymentApi.Data;
 namespace MpesaPaymentApi.Data.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260617092437_AddTransactionIndexesAndUserId")]
+    partial class AddTransactionIndexesAndUserId
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -54,9 +57,6 @@ namespace MpesaPaymentApi.Data.Migrations
                     b.Property<string>("MpesaReceiptNumber")
                         .HasColumnType("nvarchar(max)");
 
-                    b.Property<string>("OriginClientId")
-                        .HasColumnType("nvarchar(450)");
-
                     b.Property<string>("PhoneNumber")
                         .IsRequired()
                         .HasColumnType("nvarchar(450)");
@@ -91,8 +91,6 @@ namespace MpesaPaymentApi.Data.Migrations
                         .HasFilter("[CheckoutRequestID] IS NOT NULL");
 
                     b.HasIndex("CreatedAt");
-
-                    b.HasIndex("OriginClientId");
 
                     b.HasIndex("PhoneNumber");
 

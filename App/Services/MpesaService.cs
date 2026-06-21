@@ -1,19 +1,20 @@
-﻿using System;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text;
-using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MpesaPaymentApi.Data;
+using MpesaPaymentApi.Exceptions;
 using MpesaPaymentApi.Models.Configuration;
 using MpesaPaymentApi.Models.Dtos;
+using System;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace MpesaPaymentApi.Services;
 
@@ -85,6 +86,7 @@ public class MpesaService : IMpesaService
     private readonly MpesaOptions _options;
     private readonly ILogger<MpesaService> _logger;
     private readonly AppDbContext _dbContext;
+    private readonly MpesaCallbackQueue _callbackQueue;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = null,
@@ -93,20 +95,22 @@ public class MpesaService : IMpesaService
     };
 
     public MpesaService(
-        IHttpClientFactory httpClientFactory,
-        IMemoryCache memoryCache,
-        IOptions<MpesaOptions> options,
-        ILogger<MpesaService> logger,
-        AppDbContext dbContext)
+            IHttpClientFactory httpClientFactory,
+            IMemoryCache memoryCache,
+            IOptions<MpesaOptions> options,
+            ILogger<MpesaService> logger,
+            AppDbContext dbContext,
+            MpesaCallbackQueue callbackQueue)
     {
         _httpClient = httpClientFactory.CreateClient("MpesaClient");
         _cache = memoryCache;
         _options = options.Value;
         _logger = logger;
         _dbContext = dbContext;
+        _callbackQueue = callbackQueue;
     }
 
-    public async Task<MpesaStkPushResponse> SendStkPushAsync(StkPushRequest request, CancellationToken cancellationToken = default)
+    public async Task<MpesaStkPushResponse> SendStkPushAsync(StkPushRequest request, string? userId, string? originClientId, CancellationToken cancellationToken = default)
     {
         var token = await GetAccessTokenAsync(cancellationToken);
         var timestamp = DateTime.Now.ToString("yyyyMMddHHmmss");
@@ -115,6 +119,8 @@ public class MpesaService : IMpesaService
 
         var transaction = new MpesaTransaction
         {
+            UserId = userId,
+            OriginClientId = originClientId,
             PhoneNumber = normalizedPhone,
             Amount = request.Amount,
             AccountReference = request.AccountReference,
@@ -148,6 +154,7 @@ public class MpesaService : IMpesaService
         var response = await _httpClient.PostAsync("/mpesa/stkpush/v1/processrequest", jsonContent, cancellationToken);
         var responseString = await response.Content.ReadAsStringAsync(cancellationToken);
 
+
         if (!response.IsSuccessStatusCode)
         {
             transaction.Status = "Failed";
@@ -156,11 +163,11 @@ public class MpesaService : IMpesaService
 
             _logger.LogError("M-Pesa API Error: {StatusCode} - {Response}", response.StatusCode, responseString);
             var error = JsonSerializer.Deserialize<MpesaErrorResponse>(responseString, JsonOptions);
-            throw new Exception($"M-Pesa request failed: {error?.ErrorCode} - {error?.ErrorMessage}");
+            throw new MpesaApiException($"M-Pesa request failed: {error?.ErrorCode} - {error?.ErrorMessage}", response.StatusCode);
         }
 
         var result = JsonSerializer.Deserialize<MpesaStkPushResponse>(responseString, JsonOptions);
-        if (result == null) throw new Exception("Failed to deserialize M-Pesa response.");
+        if (result == null) throw new MpesaApiException("Failed to deserialize M-Pesa response.", response.StatusCode);
 
         if (!string.IsNullOrWhiteSpace(result.CheckoutRequestID))
         {
@@ -173,13 +180,22 @@ public class MpesaService : IMpesaService
         return result;
     }
 
+
     public async Task<bool> ValidateCallbackAsync(MpesaCallbackPayload payload, CancellationToken cancellationToken = default)
     {
         if (payload?.Body?.StkCallback == null) return false;
 
         var callback = payload.Body.StkCallback;
+
+        // NOTE: Safaricom does not cryptographically sign callbacks. Real authenticity
+        // enforcement belongs at the network layer: allow-list Safaricom's published
+        // callback source IPs at your firewall/reverse-proxy/WAF in front of this API.
+        // This DB-level check below catches forged/garbage CheckoutRequestIDs, but
+        // cannot by itself prove the caller is actually Safaricom.
+
         var transaction = await _dbContext.MpesaTransactions
             .FirstOrDefaultAsync(t => t.CheckoutRequestID == callback.CheckoutRequestID, cancellationToken);
+
 
         if (transaction == null)
         {
@@ -235,12 +251,18 @@ public class MpesaService : IMpesaService
         }
 
         await _dbContext.SaveChangesAsync(cancellationToken);
+
+        // Hand off any post-payment side effects to the background processor
+        // instead of doing them inline — keeps Safaricom's callback round-trip fast.
+        await _callbackQueue.EnqueueAsync(new MpesaCallbackJob(transaction.Id, callback.CheckoutRequestID), cancellationToken);
+
         return true;
     }
 
     private async Task<string> GetAccessTokenAsync(CancellationToken cancellationToken = default)
+
     {
-        return await _cache.GetOrCreateAsync("MpesaAccessToken", async entry =>
+        var token = await _cache.GetOrCreateAsync("MpesaAccessToken", async entry =>
         {
             entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(55);
 
@@ -251,20 +273,24 @@ public class MpesaService : IMpesaService
             var responseString = await response.Content.ReadAsStringAsync(cancellationToken);
 
             if (!response.IsSuccessStatusCode)
-                throw new Exception($"Failed to get M-Pesa token: {response.StatusCode} - {responseString}");
+                throw new MpesaApiException($"Failed to get M-Pesa token: {response.StatusCode} - {responseString}", response.StatusCode);
 
             var tokenResponse = JsonSerializer.Deserialize<MpesaTokenResponse>(responseString, JsonOptions);
             if (tokenResponse?.AccessToken == null)
-                throw new Exception("Invalid token response from M-Pesa.");
+                throw new MpesaApiException("Invalid token response from M-Pesa.", response.StatusCode);
 
-            return tokenResponse.AccessToken!;
+            return tokenResponse.AccessToken;
         });
+
+        if (string.IsNullOrWhiteSpace(token))
+            throw new MpesaApiException("M-Pesa access token cache returned an empty value.");
+
+        return token;
     }
 
-    public async Task<B2cRefundResponse> InitiateB2cRefundAsync(B2cRefundRequest request, CancellationToken cancellationToken = default)
+    public async Task<B2cRefundResponse> InitiateB2cRefundAsync(B2cRefundRequest request, string? originClientId, CancellationToken cancellationToken = default)
     {
         var normalizedPhone = NormalizePhoneNumber(request.PhoneNumber);
-
         var originalTransaction = await _dbContext.MpesaTransactions
             .FirstOrDefaultAsync(t => t.CheckoutRequestID == request.OriginalCheckoutRequestId, cancellationToken);
 
@@ -281,8 +307,8 @@ public class MpesaService : IMpesaService
 
         var payload = new
         {
-            InitiatorName = "testapi",
-            SecurityCredential = "SAFARICOM_SANDBOX_CREDENTIAL",
+            InitiatorName = _options.InitiatorName,
+            SecurityCredential = _options.SecurityCredential,
             CommandID = "BusinessPayment",
             Amount = request.Amount,
             PartyA = _options.ShortCode,
@@ -303,15 +329,13 @@ public class MpesaService : IMpesaService
         {
             _logger.LogError("B2C API Error: {StatusCode} - {Response}", response.StatusCode, responseString);
             var error = JsonSerializer.Deserialize<MpesaErrorResponse>(responseString, JsonOptions);
-            throw new Exception($"B2C refund failed: {error?.ErrorCode} - {error?.ErrorMessage}");
+            throw new MpesaApiException($"B2C refund failed: {error?.ErrorCode} - {error?.ErrorMessage}", response.StatusCode);
         }
 
         var result = JsonSerializer.Deserialize<B2cRefundResponse>(responseString, JsonOptions);
-        if (result == null) throw new Exception("Failed to deserialize B2C response.");
-
-        _logger.LogInformation("B2C Refund initiated: Original={Original}, Recipient={Phone}, Amount={Amount}, ConversationID={ConvId}",
-            request.OriginalCheckoutRequestId, request.PhoneNumber, request.Amount, result.ConversationID);
-
+        if (result == null) throw new MpesaApiException("Failed to deserialize B2C response.", response.StatusCode);
+        _logger.LogInformation("B2C Refund initiated: Original={Original}, Recipient={Phone}, Amount={Amount}, ConversationID={ConvId}, OriginClient={ClientId}",
+                    request.OriginalCheckoutRequestId, request.PhoneNumber, request.Amount, result.ConversationID, originClientId);
         return result;
     }
 

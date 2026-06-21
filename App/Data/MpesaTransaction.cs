@@ -5,10 +5,15 @@ namespace MpesaPaymentApi.Data;
 public class MpesaTransaction
 {
     public int Id { get; set; }
-    //public string CheckoutRequestID { get; set; } = string.Empty;
     public string? CheckoutRequestID { get; set; }
     public string MerchantRequestID { get; set; } = string.Empty;
+    /// <summary>FK to the owning user, for RLS-style query scoping. Nullable to
+    /// avoid a breaking migration on existing rows; backfill then make non-null.</summary>
+    public string? UserId { get; set; }
+    public string? OriginClientId { get; set; }
     public string PhoneNumber { get; set; } = string.Empty;
+
+
     public decimal Amount { get; set; }
     public string AccountReference { get; set; } = string.Empty;
     public string TransactionDesc { get; set; } = string.Empty;
