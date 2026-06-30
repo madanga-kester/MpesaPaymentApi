@@ -19,9 +19,7 @@ public class AppDbContext : DbContext
             .Property(e => e.Amount)
             .HasPrecision(18, 2);
 
-        // Indexes on the columns MpesaController actually filters/sorts by
-        // (GetTransactions: phoneNumber, status, ordered by CreatedAt;
-        //  GetTransactionByCheckoutId: CheckoutRequestID — already indexed above).
+       
         modelBuilder.Entity<MpesaTransaction>()
             .HasIndex(e => e.PhoneNumber);
 
@@ -36,8 +34,7 @@ public class AppDbContext : DbContext
 
         modelBuilder.Entity<MpesaTransaction>()
             .HasIndex(e => e.OriginClientId);
-        // Composite index matching the most common real query shape:
-        // "this user's transactions, optionally by status, newest first"
+       
         modelBuilder.Entity<MpesaTransaction>()
             .HasIndex(e => new { e.UserId, e.Status, e.CreatedAt });
     }

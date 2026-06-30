@@ -15,10 +15,9 @@ using MpesaPaymentApi.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// PII/security-artifact logging is ONLY ever enabled in Development, and only
-// via explicit code here — never a blanket switch that could survive into prod.
+
 IdentityModelEventSource.ShowPII = builder.Environment.IsDevelopment();
-IdentityModelEventSource.LogCompleteSecurityArtifact = false; // never log raw tokens, even in dev
+IdentityModelEventSource.LogCompleteSecurityArtifact = false; 
 
 builder.Host.UseSerilog((context, services, loggerConfig) => loggerConfig
     .ReadFrom.Configuration(context.Configuration)
@@ -59,9 +58,6 @@ var signingKey = new SymmetricSecurityKey(keyBytes);
 builder.Services.Configure<MpesaOptions>(builder.Configuration.GetSection("Mpesa"));
 builder.Services.Configure<MpesaPaymentApi.Models.Configuration.ClientAppOptions>(builder.Configuration.GetSection("ClientApps"));
 builder.Services.AddHostedService<StalePendingTransactionService>();
-
-// Background queue for long-running work (refunds, notifications) so requests
-// never block on slow downstream calls — see CallbackQueueProcessor below.
 builder.Services.AddSingleton<MpesaCallbackQueue>();
 builder.Services.AddHostedService<MpesaCallbackQueueProcessor>();
 
@@ -75,8 +71,7 @@ builder.Services.AddHttpClient("MpesaClient", client =>
     client.BaseAddress = new Uri(baseUrl);
     client.Timeout = TimeSpan.FromSeconds(30);
 })
-.AddStandardResilienceHandler(); // retry + circuit breaker + timeout against Safaricom's API
-
+.AddStandardResilienceHandler(); 
 builder.Services.AddDbContextPool<AppDbContext>(options =>
     options.UseSqlServer(
         builder.Configuration.GetConnectionString("DefaultConnection"),
@@ -93,8 +88,7 @@ builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
-    // Partitioned by X-Client-Id (falling back to IP) so one frontend's traffic
-    // spike can't exhaust the shared limit and 429 every other frontend's users.
+    
     options.AddPolicy("api", httpContext =>
     {
         var clientId = httpContext.Request.Headers["X-Client-Id"].ToString();
@@ -112,7 +106,7 @@ builder.Services.AddRateLimiter(options =>
 
     options.AddFixedWindowLimiter("callback", limiterOptions =>
     {
-        // Safaricom's callback endpoint gets a looser, IP-scoped limit since it's [AllowAnonymous]
+        
         limiterOptions.PermitLimit = 60;
         limiterOptions.Window = TimeSpan.FromMinutes(1);
         limiterOptions.QueueLimit = 0;
@@ -151,11 +145,9 @@ builder.Services.AddCors(options =>
 builder.Services.AddControllers()
     .AddJsonOptions(o => o.JsonSerializerOptions.DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull);
 
-builder.Services.AddProblemDetails(); // RFC 7807 structured error responses
+builder.Services.AddProblemDetails(); 
 builder.Services.AddHttpContextAccessor();
-// API versioning deferred — add Asp.Versioning.Mvc package and builder.Services.AddApiVersioning() when you have a breaking change to ship.
-
-//  JWT Authentication 
+ 
 builder.Services
     .AddAuthentication(options =>
     {
@@ -238,8 +230,7 @@ builder.Services.AddAuthorizationBuilder()
 
 var app = builder.Build();
 
-// Centralized exception handling — replaces the dev exception page entirely so
-// behavior is identical in shape between environments (only verbosity differs).
+
 app.UseMiddleware<GlobalExceptionMiddleware>();
 
 if (!app.Environment.IsDevelopment())
@@ -259,11 +250,11 @@ app.MapControllers().RequireRateLimiting("api");
 
 app.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
 {
-    Predicate = _ => false // liveness: just "is the process up", no dependency checks
+    Predicate = _ => false 
 });
 app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
 {
-    Predicate = check => check.Tags.Contains("ready") // readiness: DB reachable
+    Predicate = check => check.Tags.Contains("ready") 
 });
 
 try

@@ -3,12 +3,6 @@ namespace MpesaPaymentApi.Services;
 
 public record MpesaCallbackJob(int TransactionId, string CheckoutRequestId);
 
-/// <summary>
-/// In-process bounded queue for post-callback side effects (notifications, receipts, etc.)
-/// For multi-instance/horizontal scaling, replace this with a real broker
-/// (Azure Service Bus, AWS SQS, RabbitMQ) so jobs survive instance restarts
-/// and are shared across instances instead of being per-process.
-/// </summary>
 public class MpesaCallbackQueue
 {
     private readonly Channel<MpesaCallbackJob> _channel =
@@ -47,9 +41,7 @@ public class MpesaCallbackQueueProcessor : BackgroundService
             try
             {
                 using var scope = _scopeFactory.CreateScope();
-                // Example future work — replace with real post-payment side effects:
-                // var notifier = scope.ServiceProvider.GetRequiredService<INotificationService>();
-                // await notifier.SendPaymentReceiptAsync(job.TransactionId, stoppingToken);
+                
                 _logger.LogInformation("Processed background job for transaction {TransactionId}", job.TransactionId);
             }
             catch (Exception ex)

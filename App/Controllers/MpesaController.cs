@@ -77,8 +77,7 @@ public class MpesaController : ControllerBase
 
         var query = _dbContext.MpesaTransactions.AsQueryable();
 
-        // Row-level scoping: non-admins only ever see their own transactions,
-        // regardless of what filters they pass in the query string.
+        
         if (!User.IsInRole("Admin"))
         {
             var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
@@ -207,7 +206,7 @@ public class MpesaController : ControllerBase
         var response = await _mpesaService.InitiateB2cRefundAsync(request, clientId, ct);
         return Ok(response);
     }
-    //  Callback (Safaricom  this API, no auth)
+    //  Callback (Safaricom 
     [HttpPost("callback")]
     [AllowAnonymous]
     [EnableRateLimiting("callback")]
@@ -225,6 +224,6 @@ public class MpesaController : ControllerBase
         var result = await _mpesaService.ValidateCallbackAsync(payload, ct);
         return result
             ? Ok(new { ResultCode = 0, ResultDesc = "Accepted" })
-            : Ok(new { ResultCode = 1, ResultDesc = "Rejected" }); // Safaricom expects 200 either way; retries on non-2xx
+            : Ok(new { ResultCode = 1, ResultDesc = "Rejected" }); 
     }
 }

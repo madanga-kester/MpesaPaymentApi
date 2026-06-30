@@ -187,11 +187,7 @@ public class MpesaService : IMpesaService
 
         var callback = payload.Body.StkCallback;
 
-        // NOTE: Safaricom does not cryptographically sign callbacks. Real authenticity
-        // enforcement belongs at the network layer: allow-list Safaricom's published
-        // callback source IPs at your firewall/reverse-proxy/WAF in front of this API.
-        // This DB-level check below catches forged/garbage CheckoutRequestIDs, but
-        // cannot by itself prove the caller is actually Safaricom.
+        
 
         var transaction = await _dbContext.MpesaTransactions
             .FirstOrDefaultAsync(t => t.CheckoutRequestID == callback.CheckoutRequestID, cancellationToken);
@@ -252,8 +248,6 @@ public class MpesaService : IMpesaService
 
         await _dbContext.SaveChangesAsync(cancellationToken);
 
-        // Hand off any post-payment side effects to the background processor
-        // instead of doing them inline — keeps Safaricom's callback round-trip fast.
         await _callbackQueue.EnqueueAsync(new MpesaCallbackJob(transaction.Id, callback.CheckoutRequestID), cancellationToken);
 
         return true;

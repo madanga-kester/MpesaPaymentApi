@@ -47,7 +47,7 @@ public class GlobalExceptionMiddleware
 
             await context.Response.WriteAsync(JsonSerializer.Serialize(problem));
 
-            // TODO: wire to your alerting channel (Slack/PagerDuty/email) for 5xx specifically:
+            // TODO: wire to an alerting channel (Slack/PagerDuty/email) for 5xx specifically:
             if (context.Response.StatusCode >= 500)
             {
                 // await _alertService.NotifyAsync($"5xx on {context.Request.Path}: {ex.Message}");
