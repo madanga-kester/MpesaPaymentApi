@@ -1,3 +1,5 @@
+
+
 using System.ComponentModel.DataAnnotations;
 
 namespace MpesaPaymentApi.Models.Dtos;
@@ -13,4 +15,8 @@ public record StkPushRequest(
     string AccountReference,
 
     [Required, StringLength(100, MinimumLength = 1)]
-    string TransactionDesc);
+    string TransactionDesc,
+
+    string? RecipientFreelancerId = null);
+
+

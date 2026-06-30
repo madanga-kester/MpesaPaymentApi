@@ -1,4 +1,6 @@
-﻿using System;
+﻿
+
+using System;
 
 namespace MpesaPaymentApi.Data;
 
@@ -7,11 +9,13 @@ public class MpesaTransaction
     public int Id { get; set; }
     public string? CheckoutRequestID { get; set; }
     public string MerchantRequestID { get; set; } = string.Empty;
-  
+
     public string? UserId { get; set; }
     public string? OriginClientId { get; set; }
     public string PhoneNumber { get; set; } = string.Empty;
 
+
+    public string? RecipientFreelancerId { get; set; }
 
     public decimal Amount { get; set; }
     public string AccountReference { get; set; } = string.Empty;

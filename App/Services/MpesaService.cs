@@ -1,4 +1,12 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿
+
+
+
+
+
+
+
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -9,6 +17,7 @@ using MpesaPaymentApi.Exceptions;
 using MpesaPaymentApi.Models.Configuration;
 using MpesaPaymentApi.Models.Dtos;
 using System;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -18,7 +27,7 @@ using System.Threading.Tasks;
 
 namespace MpesaPaymentApi.Services;
 
- 
+
 public class StalePendingTransactionService : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
@@ -68,7 +77,7 @@ public class StalePendingTransactionService : BackgroundService
             }
             catch (OperationCanceledException)
             {
-                
+
             }
             catch (Exception ex)
             {
@@ -125,6 +134,8 @@ public class MpesaService : IMpesaService
             Amount = request.Amount,
             AccountReference = request.AccountReference,
             TransactionDesc = request.TransactionDesc,
+           
+            RecipientFreelancerId = request.RecipientFreelancerId,
             Status = "Pending",
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
@@ -187,7 +198,7 @@ public class MpesaService : IMpesaService
 
         var callback = payload.Body.StkCallback;
 
-        
+
 
         var transaction = await _dbContext.MpesaTransactions
             .FirstOrDefaultAsync(t => t.CheckoutRequestID == callback.CheckoutRequestID, cancellationToken);
@@ -210,7 +221,7 @@ public class MpesaService : IMpesaService
         transaction.CallbackReceivedAt = DateTime.UtcNow;
         transaction.UpdatedAt = DateTime.UtcNow;
 
-        
+
         transaction.Status = callback.ResultCode switch
         {
             0 => "Success",    // Payment completed
@@ -250,7 +261,133 @@ public class MpesaService : IMpesaService
 
         await _callbackQueue.EnqueueAsync(new MpesaCallbackJob(transaction.Id, callback.CheckoutRequestID), cancellationToken);
 
+
+        if (transaction.Status == "Success" && !string.IsNullOrWhiteSpace(transaction.RecipientFreelancerId))
+        {
+            try
+            {
+                await SettleFreelancerAsync(transaction, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Freelancer settlement failed for transaction {TransactionId} (freelancer {FreelancerId}). " +
+                    "Inbound payment was still recorded as Success — this needs manual review.",
+                    transaction.Id, transaction.RecipientFreelancerId);
+            }
+        }
+
         return true;
+    }
+
+  
+    private async Task SettleFreelancerAsync(MpesaTransaction transaction, CancellationToken cancellationToken)
+    {
+        var payoutDetail = await _dbContext.PayoutDetails
+            .FirstOrDefaultAsync(p => p.UserId == transaction.RecipientFreelancerId, cancellationToken);
+
+        if (payoutDetail == null)
+        {
+            _logger.LogWarning(
+                "No payout details found for freelancer {FreelancerId}. Transaction {TransactionId} needs manual settlement.",
+                transaction.RecipientFreelancerId, transaction.Id);
+
+            _dbContext.FreelancerPayouts.Add(new FreelancerPayout
+            {
+                MpesaTransactionId = transaction.Id,
+                FreelancerId = transaction.RecipientFreelancerId!,
+                GrossAmount = transaction.Amount,
+                PlatformFee = 0m,
+                NetAmount = transaction.Amount,
+                Method = "unknown",
+                Status = "ManualReview",
+                ResultDesc = "No payout method on file for this freelancer.",
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            });
+            await _dbContext.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        // Platform fee stubbed at 0% for now — adjust  once pricing is decided.
+        var platformFee = 0m;
+        var netAmount = transaction.Amount - platformFee;
+
+        var payout = new FreelancerPayout
+        {
+            MpesaTransactionId = transaction.Id,
+            FreelancerId = payoutDetail.UserId,
+            GrossAmount = transaction.Amount,
+            PlatformFee = platformFee,
+            NetAmount = netAmount,
+            Method = payoutDetail.Method,
+            Status = "Processing",
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+        _dbContext.FreelancerPayouts.Add(payout);
+        await _dbContext.SaveChangesAsync(cancellationToken);
+
+        // flag for manual/batch processing.
+        if (payoutDetail.Method == "bank")
+        {
+            payout.Status = "ManualReview";
+            payout.ResultDesc = "Bank payout — requires manual bank transfer processing.";
+            payout.UpdatedAt = DateTime.UtcNow;
+            await _dbContext.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        // M-Pesa methods (phone, till, paybill) settle via B2C.
+        string payoutDestination = payoutDetail.Method switch
+        {
+            "mpesa-phone" => NormalizePhoneNumber(payoutDetail.PhoneNumber ?? string.Empty),
+            "mpesa-till" => payoutDetail.TillNumber ?? string.Empty,
+            "mpesa-paybill" => payoutDetail.PaybillNumber ?? string.Empty,
+            _ => string.Empty
+        };
+
+        if (string.IsNullOrWhiteSpace(payoutDestination))
+        {
+            payout.Status = "Failed";
+            payout.ResultDesc = $"Payout method '{payoutDetail.Method}' is missing its destination value.";
+            payout.UpdatedAt = DateTime.UtcNow;
+            await _dbContext.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        try
+        {
+            var b2cResult = await SendB2cPaymentAsync(
+                amount: netAmount,
+                partyB: payoutDestination,
+                remarks: $"Payout for {transaction.AccountReference ?? transaction.CheckoutRequestID}",
+                occasion: $"Settlement-{transaction.Id}",
+                cancellationToken: cancellationToken);
+
+            payout.ConversationID = b2cResult.ConversationID;
+            payout.OriginatorConversationID = b2cResult.OriginatorConversationID;
+            payout.Status = "Processing"; 
+            payout.ResultDesc = "B2C payout initiated; awaiting Safaricom result callback.";
+            payout.UpdatedAt = DateTime.UtcNow;
+
+            _logger.LogInformation(
+                "Freelancer payout initiated. Freelancer={FreelancerId}, Amount={Amount}, Method={Method}, ConversationID={ConvId}",
+                payoutDetail.UserId, netAmount, payoutDetail.Method, b2cResult.ConversationID);
+        }
+        catch (Exception ex)
+        {
+            payout.Status = "Failed";
+            payout.ResultDesc = ex.Message;
+            _logger.LogError(ex,
+                "B2C payout failed for freelancer {FreelancerId}, transaction {TransactionId}",
+                payoutDetail.UserId, transaction.Id);
+        }
+        finally
+        {
+            payout.UpdatedAt = DateTime.UtcNow;
+            await _dbContext.SaveChangesAsync(cancellationToken);
+        }
     }
 
     private async Task<string> GetAccessTokenAsync(CancellationToken cancellationToken = default)
@@ -297,6 +434,27 @@ public class MpesaService : IMpesaService
         if (originalTransaction.Amount < request.Amount)
             throw new Exception($"Refund amount ({request.Amount}) exceeds original payment ({originalTransaction.Amount})");
 
+      
+        var result = await SendB2cPaymentAsync(
+            amount: request.Amount,
+            partyB: normalizedPhone,
+            remarks: request.Reason,
+            occasion: $"Refund-{request.OriginalCheckoutRequestId}",
+            cancellationToken: cancellationToken);
+
+        _logger.LogInformation("B2C Refund initiated: Original={Original}, Recipient={Phone}, Amount={Amount}, ConversationID={ConvId}, OriginClient={ClientId}",
+                    request.OriginalCheckoutRequestId, request.PhoneNumber, request.Amount, result.ConversationID, originClientId);
+        return result;
+    }
+
+  
+    private async Task<B2cRefundResponse> SendB2cPaymentAsync(
+        decimal amount,
+        string partyB,
+        string remarks,
+        string occasion,
+        CancellationToken cancellationToken)
+    {
         var token = await GetAccessTokenAsync(cancellationToken);
 
         var payload = new
@@ -304,13 +462,13 @@ public class MpesaService : IMpesaService
             InitiatorName = _options.InitiatorName,
             SecurityCredential = _options.SecurityCredential,
             CommandID = "BusinessPayment",
-            Amount = request.Amount,
+            Amount = amount,
             PartyA = _options.ShortCode,
-            PartyB = normalizedPhone,
-            Remarks = request.Reason,
+            PartyB = partyB,
+            Remarks = remarks,
             QueueTimeOutURL = _options.CallbackUrl,
             ResultURL = _options.CallbackUrl,
-            Occasion = $"Refund-{request.OriginalCheckoutRequestId}"
+            Occasion = occasion
         };
 
         var jsonContent = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8, "application/json");
@@ -323,15 +481,80 @@ public class MpesaService : IMpesaService
         {
             _logger.LogError("B2C API Error: {StatusCode} - {Response}", response.StatusCode, responseString);
             var error = JsonSerializer.Deserialize<MpesaErrorResponse>(responseString, JsonOptions);
-            throw new MpesaApiException($"B2C refund failed: {error?.ErrorCode} - {error?.ErrorMessage}", response.StatusCode);
+            throw new MpesaApiException($"B2C payment failed: {error?.ErrorCode} - {error?.ErrorMessage}", response.StatusCode);
         }
 
         var result = JsonSerializer.Deserialize<B2cRefundResponse>(responseString, JsonOptions);
         if (result == null) throw new MpesaApiException("Failed to deserialize B2C response.", response.StatusCode);
-        _logger.LogInformation("B2C Refund initiated: Original={Original}, Recipient={Phone}, Amount={Amount}, ConversationID={ConvId}, OriginClient={ClientId}",
-                    request.OriginalCheckoutRequestId, request.PhoneNumber, request.Amount, result.ConversationID, originClientId);
+
         return result;
     }
+
+ 
+    public async Task<PayoutDetailResponse?> GetPayoutSettingsAsync(string freelancerId, CancellationToken cancellationToken = default)
+    {
+        var detail = await _dbContext.PayoutDetails
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.UserId == freelancerId, cancellationToken);
+
+        if (detail == null) return null;
+
+        return ToResponse(detail);
+    }
+
+    public async Task<PayoutDetailResponse> SavePayoutSettingsAsync(string freelancerId, PayoutDetailRequest request, CancellationToken cancellationToken = default)
+    {
+        var validMethods = new[] { "mpesa-phone", "mpesa-till", "mpesa-paybill", "bank" };
+        if (!validMethods.Contains(request.Method))
+            throw new ArgumentException($"Invalid payout method: '{request.Method}'");
+
+        var detail = await _dbContext.PayoutDetails
+            .FirstOrDefaultAsync(p => p.UserId == freelancerId, cancellationToken);
+
+        if (detail == null)
+        {
+            detail = new PayoutDetail
+            {
+                UserId = freelancerId,
+                CreatedAt = DateTime.UtcNow
+            };
+            _dbContext.PayoutDetails.Add(detail);
+        }
+
+        detail.Method = request.Method;
+        detail.PhoneNumber = request.PhoneNumber;
+        detail.TillNumber = request.TillNumber;
+        detail.PaybillNumber = request.PaybillNumber;
+        detail.PaybillAccount = request.PaybillAccount;
+        detail.BankName = request.BankName;
+        detail.BankAccountName = request.BankAccountName;
+        detail.BankAccountNumber = request.BankAccountNumber;
+        detail.BankBranchCode = request.BankBranchCode;
+       
+        detail.IsVerified = false;
+        detail.UpdatedAt = DateTime.UtcNow;
+
+        await _dbContext.SaveChangesAsync(cancellationToken);
+
+        return ToResponse(detail);
+    }
+
+    private static PayoutDetailResponse ToResponse(PayoutDetail detail) => new()
+    {
+        Id = detail.Id,
+        FreelancerId = detail.UserId,
+        Method = detail.Method,
+        PhoneNumber = detail.PhoneNumber,
+        TillNumber = detail.TillNumber,
+        PaybillNumber = detail.PaybillNumber,
+        PaybillAccount = detail.PaybillAccount,
+        BankName = detail.BankName,
+        BankAccountName = detail.BankAccountName,
+        BankAccountNumber = detail.BankAccountNumber,
+        BankBranchCode = detail.BankBranchCode,
+        IsVerified = detail.IsVerified,
+        UpdatedAt = detail.UpdatedAt
+    };
 
     private static string NormalizePhoneNumber(string phoneNumber)
     {
