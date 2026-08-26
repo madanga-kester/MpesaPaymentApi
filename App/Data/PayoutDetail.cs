@@ -1,9 +1,4 @@
-﻿//namespace MpesaPaymentApi.App.Data
-//{
-//    public class PayoutDetail
-//    {
-//    }
-//}
+﻿
 
 
 using System;
@@ -31,7 +26,7 @@ public class PayoutDetail
     public string? PaybillNumber { get; set; }
     public string? PaybillAccount { get; set; }
 
-    // Bank payout (not B2C-automatable — settled manually/via batch)
+    // Bank payout ( B2C-automatable — settled manually/via batch)
     public string? BankName { get; set; }
     public string? BankAccountName { get; set; }
     public string? BankAccountNumber { get; set; }

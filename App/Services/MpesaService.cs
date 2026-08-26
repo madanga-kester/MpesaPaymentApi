@@ -1,11 +1,5 @@
 ﻿
 
-
-
-
-
-
-
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
@@ -309,7 +303,7 @@ public class MpesaService : IMpesaService
             return;
         }
 
-        // Platform fee stubbed at 0% for now — adjust  once pricing is decided.
+        // Platform fee stubbed at 0% for now — adjusting  once pricing is decided.
         var platformFee = 0m;
         var netAmount = transaction.Amount - platformFee;
 
@@ -338,7 +332,7 @@ public class MpesaService : IMpesaService
             return;
         }
 
-        // M-Pesa methods (phone, till, paybill) settle via B2C.
+        // M-Pesa methods (phone, till, paybill) settled via B2C.
         string payoutDestination = payoutDetail.Method switch
         {
             "mpesa-phone" => NormalizePhoneNumber(payoutDetail.PhoneNumber ?? string.Empty),
